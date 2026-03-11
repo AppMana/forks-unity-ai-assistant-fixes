@@ -390,6 +390,95 @@ namespace Unity.AI.MCP.Editor
             McpLog.Log("UnityMCPBridge stopped.");
         }
 
+        /// <summary>
+        /// Lightweight shutdown for domain reload. Cancels tasks, closes socket and clients,
+        /// but preserves discovery files and writes "reloading" status so the MCP client
+        /// knows to wait and reconnect rather than treating Unity as gone.
+        /// </summary>
+        void StopForReload()
+        {
+            Task toWait = null;
+            lock (startStopLock)
+            {
+                if (!isRunning)
+                    return;
+
+                try
+                {
+                    isRunning = false;
+
+                    // Write "reloading" status instead of deleting discovery files.
+                    // The MCP client can see this and know to retry the connection.
+                    try
+                    {
+                        ServerDiscovery.SaveStatusFile(
+                            currentConnectionPath ?? ServerDiscovery.GetConnectionPath(),
+                            "reloading");
+                    }
+                    catch { }
+
+                    // Clear gateway connections
+                    EditorApplication.delayCall += () =>
+                    {
+                        ConnectionRegistry.instance.ClearAllGatewayConnections();
+                    };
+
+                    // Quiesce background listener
+                    var cancel = cts;
+                    cts = null;
+                    try { cancel?.Cancel(); } catch { }
+
+                    try { listener?.Stop(); } catch { }
+                    try { listener?.Dispose(); } catch { }
+                    listener = null;
+
+                    toWait = listenerTask;
+                    listenerTask = null;
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogError($"Error during StopForReload: {ex.Message}");
+                }
+            }
+
+            // Close all active clients
+            IConnectionTransport[] toClose;
+            lock (clientsLock)
+            {
+                toClose = identityToTransportMap.Values.ToArray();
+                identityToTransportMap.Clear();
+                transportToIdentityMap.Clear();
+                gatewayIdentityKeys.Clear();
+            }
+            McpLog.ClearOnceKeys();
+            foreach (var c in toClose)
+            {
+                try { c.Close(); c.Dispose(); } catch { }
+            }
+
+            // Unblock any pending command waiters
+            lock (lockObj)
+            {
+                foreach (var kvp in commandQueue.Values)
+                {
+                    kvp.tcs.TrySetResult(JsonConvert.SerializeObject(new
+                    {
+                        status = "error",
+                        error = "Bridge reloading"
+                    }));
+                }
+                commandQueue.Clear();
+            }
+
+            if (toWait != null)
+            {
+                try { toWait.Wait(2000); } catch { }
+            }
+
+            try { EditorApplication.update -= ProcessCommands; } catch { }
+            McpLog.Log("UnityMCPBridge stopped for domain reload (discovery files preserved).");
+        }
+
         public void Dispose()
         {
             try { Stop(); } catch { }
@@ -1744,9 +1833,9 @@ namespace Unity.AI.MCP.Editor
 
         void OnBeforeAssemblyReload()
         {
-            // Stop cleanly before reload
-            try { Stop(); } catch { }
-            // Avoid file I/O or heavy work here
+            // Lightweight shutdown for domain reload: cancel tasks and close socket/clients,
+            // but keep discovery files alive so the MCP client can reconnect after reload.
+            try { StopForReload(); } catch { }
         }
 
         void OnAfterAssemblyReload()
