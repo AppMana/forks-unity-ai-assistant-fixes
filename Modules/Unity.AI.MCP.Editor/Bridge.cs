@@ -217,7 +217,7 @@ namespace Unity.AI.MCP.Editor
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
             AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
             EditorApplication.quitting += Stop;
-            EditorApplication.playModeStateChanged += _ => ScheduleInitRetry();
+            EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
             McpToolRegistry.ToolsChanged += OnToolsChanged;
             UnityMCPBridge.MaxDirectConnectionsPolicyChanged += RefreshCachedMaxDirectConnections;
             RefreshCachedMaxDirectConnections();
@@ -1726,6 +1726,19 @@ namespace Unity.AI.MCP.Editor
                     status = "success",
                     result = new { approved = false, reason = $"Approval error: {ex.Message}" }
                 });
+            }
+        }
+
+        void OnPlayModeStateChanged(PlayModeStateChange state)
+        {
+            // Only restart after domain reload completes (EnteredPlayMode / EnteredEditMode).
+            // The transitional states (ExitingEditMode / ExitingPlayMode) fire BEFORE domain
+            // reload and would prematurely stop the bridge, dropping active connections.
+            // OnBeforeAssemblyReload/OnAfterAssemblyReload handle the domain reload lifecycle.
+            if (state == PlayModeStateChange.EnteredPlayMode || state == PlayModeStateChange.EnteredEditMode)
+            {
+                if (!isRunning)
+                    ScheduleInitRetry();
             }
         }
 
