@@ -380,10 +380,10 @@ namespace Unity.AI.MCP.Editor
 
             if (toWait != null)
             {
-                // Wait for listener task to complete (increased timeout for slower CI machines)
-                // The listener task should complete quickly after cancellation, but on Linux
-                // the accept() call may take a moment to return after the socket is closed
-                try { toWait.Wait(1000); } catch { }
+                // Wait for listener task to complete.
+                // With poll()-based accept, the task should exit within POLL_TIMEOUT_MS (200ms)
+                // after cancellation. We allow 2000ms for safety on slower machines.
+                try { toWait.Wait(2000); } catch { }
             }
 
             try { EditorApplication.update -= ProcessCommands; } catch { }

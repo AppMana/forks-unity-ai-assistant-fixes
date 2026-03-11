@@ -32,6 +32,22 @@ namespace Unity.AI.MCP.Editor.Connection
         static extern int close(int fd);
 
         [DllImport("libc", SetLastError = true)]
+        static extern int poll(ref PollFd fds, uint nfds, int timeout);
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct PollFd
+        {
+            public int fd;
+            public short events;
+            public short revents;
+        }
+
+        const short POLLIN = 0x0001;  // Data available to read (incoming connection ready)
+        const short POLLHUP = 0x0010; // Hang up
+        const short POLLERR = 0x0008; // Error condition
+        const int POLL_TIMEOUT_MS = 200; // Check cancellation every 200ms
+
+        [DllImport("libc", SetLastError = true)]
         static extern int chmod(string pathname, uint mode);
 
         [DllImport("libc", SetLastError = true)]
@@ -275,21 +291,61 @@ namespace Unity.AI.MCP.Editor.Connection
 
             try
             {
-                // Accept connection on background thread (accept() is blocking)
+                // Accept connection on background thread using poll() + accept()
+                // poll() with timeout allows us to check cancellation periodically
+                // instead of blocking indefinitely in accept()
                 int clientSocket = await Task.Run(() =>
                 {
                     while (!cancellationToken.IsCancellationRequested && isListening)
                     {
-                        // Check if socket is still valid before calling accept
-                        if (serverSocket < 0)
+                        // Snapshot the socket fd under lock to prevent TOCTOU race with Stop()
+                        int socketFd;
+                        lock (lockObj)
+                        {
+                            socketFd = serverSocket;
+                        }
+
+                        if (socketFd < 0)
                         {
                             throw new OperationCanceledException("Server socket was closed");
                         }
 
-                        // Accept with timeout by checking cancellation periodically
-                        // Note: This is not ideal but accept() doesn't have a timeout parameter
-                        // A better approach would use poll() or select(), but this is simpler
-                        int fd = accept(serverSocket, IntPtr.Zero, IntPtr.Zero);
+                        // Use poll() to wait for incoming connection with timeout
+                        // This is the key fix: poll() returns after POLL_TIMEOUT_MS even if
+                        // no connection arrives, allowing us to check cancellation
+                        var pollFd = new PollFd
+                        {
+                            fd = socketFd,
+                            events = POLLIN,
+                            revents = 0
+                        };
+
+                        int pollResult = poll(ref pollFd, 1, POLL_TIMEOUT_MS);
+
+                        if (pollResult < 0)
+                        {
+                            int pollError = Marshal.GetLastWin32Error();
+                            if (pollError == EINTR)
+                                continue; // Interrupted by signal, retry
+                            if (pollError == EBADF)
+                                throw new OperationCanceledException("Server socket was closed during poll");
+                            throw new InvalidOperationException($"poll() failed: errno={pollError}");
+                        }
+
+                        if (pollResult == 0)
+                        {
+                            // Timeout - no incoming connection, loop back to check cancellation
+                            continue;
+                        }
+
+                        // Check for error conditions on the socket
+                        if ((pollFd.revents & (POLLERR | POLLHUP)) != 0)
+                        {
+                            throw new OperationCanceledException("Server socket error or hangup during poll");
+                        }
+
+                        // poll() indicated a connection is ready - accept() should not block
+                        int fd = accept(socketFd, IntPtr.Zero, IntPtr.Zero);
                         if (fd >= 0)
                         {
                             return fd;
